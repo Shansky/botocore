@@ -529,7 +529,7 @@ def add_generate_presigned_url(class_attributes, **kwargs):
 
 
 def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=3600,
-                           HttpMethod=None):
+                           HttpMethod=None, remove_bucket_from_path=False):
     """Generate a presigned url given a client, its method, and arguments
 
     :type ClientMethod: string
@@ -568,6 +568,14 @@ def generate_presigned_url(self, ClientMethod, Params=None, ExpiresIn=3600,
     # Create a request dict based on the params to serialize.
     request_dict = serializer.serialize_to_request(
         params, operation_model)
+
+    if remove_bucket_from_path:
+        path_without_bucket = request_dict['url_path'].strip(
+            '/',
+        ).partition(
+            '/',
+        )[2]
+        request_dict['url_path'] = f'/{path_without_bucket}'
 
     # Switch out the http method if user specified it.
     if http_method is not None:
