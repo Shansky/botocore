@@ -37,9 +37,11 @@ from botocore import UNSIGNED
 # Keep this imported.  There's pre-existing code that uses
 # "from botocore.client import Config".
 from botocore.config import Config
+from botocore.history import get_global_history_recorder
 
 
 logger = logging.getLogger(__name__)
+history_recorder = get_global_history_recorder()
 
 
 class ClientCreator(object):
@@ -61,6 +63,9 @@ class ClientCreator(object):
                       credentials=None, scoped_config=None,
                       api_version=None,
                       client_config=None):
+        responses = self._event_emitter.emit(
+            'choose-service-name', service_name=service_name)
+        service_name = first_non_none_response(responses, default=service_name)
         service_model = self._load_service_model(service_name, api_version)
         cls = self._create_client_class(service_name, service_model)
         endpoint_bridge = ClientEndpointBridge(
@@ -70,6 +75,7 @@ class ClientCreator(object):
             service_model, region_name, is_secure, endpoint_url,
             verify, credentials, scoped_config, client_config, endpoint_bridge)
         service_client = cls(**client_args)
+        self._register_retries(service_client)
         self._register_s3_events(
             service_client, endpoint_bridge, endpoint_url, client_config,
             scoped_config)
@@ -95,11 +101,10 @@ class ClientCreator(object):
         json_model = self._loader.load_service_model(service_name, 'service-2',
                                                      api_version=api_version)
         service_model = ServiceModel(json_model, service_name=service_name)
-        self._register_retries(service_model)
         return service_model
 
-    def _register_retries(self, service_model):
-        endpoint_prefix = service_model.endpoint_prefix
+    def _register_retries(self, client):
+        endpoint_prefix = client.meta.service_model.endpoint_prefix
 
         # First, we load the entire retry config for all services,
         # then pull out just the information we need.
@@ -109,15 +114,17 @@ class ClientCreator(object):
 
         retry_config = self._retry_config_translator.build_retry_config(
             endpoint_prefix, original_config.get('retry', {}),
-            original_config.get('definitions', {}))
+            original_config.get('definitions', {}),
+            client.meta.config.retries
+        )
 
         logger.debug("Registering retry handlers for service: %s",
-                     service_model.service_name)
+                     client.meta.service_model.service_name)
         handler = self._retry_handler_factory.create_retry_handler(
             retry_config, endpoint_prefix)
         unique_id = 'retry-config-%s' % endpoint_prefix
-        self._event_emitter.register('needs-retry.%s' % endpoint_prefix,
-                                     handler, unique_id=unique_id)
+        client.meta.events.register('needs-retry.%s' % endpoint_prefix,
+                                    handler, unique_id=unique_id)
 
     def _register_s3_events(self, client, endpoint_bridge, endpoint_url,
                             client_config, scoped_config):
@@ -125,26 +132,29 @@ class ClientCreator(object):
             return
         S3RegionRedirector(endpoint_bridge, client).register()
         self._set_s3_addressing_style(
-            endpoint_url, client.meta.config.s3, client.meta.events)
+            endpoint_url, client.meta.config.s3, client.meta.events,
+            client.meta.partition
+        )
         # Enable accelerate if the configuration is set to to true or the
         # endpoint being used matches one of the accelerate endpoints.
         if self._is_s3_accelerate(endpoint_url, client.meta.config.s3):
             # Also make sure that the hostname gets switched to
             # s3-accelerate.amazonaws.com
             client.meta.events.register_first(
-                'request-created.s3', switch_host_s3_accelerate)
+                'before-sign.s3', switch_host_s3_accelerate)
 
         self._set_s3_presign_signature_version(
             client.meta, client_config, scoped_config)
 
-    def _set_s3_addressing_style(self, endpoint_url, s3_config, event_emitter):
+    def _set_s3_addressing_style(self, endpoint_url, s3_config, event_emitter,
+                                 partition):
         if s3_config is None:
             s3_config = {}
 
         addressing_style = self._get_s3_addressing_style(
             endpoint_url, s3_config)
         handler = self._get_s3_addressing_handler(
-            endpoint_url, s3_config, addressing_style)
+            endpoint_url, s3_config, addressing_style, partition)
         if handler is not None:
             event_emitter.register('before-sign.s3', handler)
 
@@ -161,7 +171,7 @@ class ClientCreator(object):
             return configured_addressing_style
 
     def _get_s3_addressing_handler(self, endpoint_url, s3_config,
-                                   addressing_style):
+                                   addressing_style, partition):
         # If virtual host style was configured, use it regardless of whether
         # or not the bucket looks dns compatible.
         if addressing_style == 'virtual':
@@ -178,12 +188,6 @@ class ClientCreator(object):
 
         logger.debug("Defaulting to S3 virtual host style addressing with "
                      "path style addressing fallback.")
-
-        # For dual stack mode, we need to clear the default endpoint url in
-        # order to use the existing netloc if the bucket is dns compatible.
-        if s3_config.get('use_dualstack_endpoint', False):
-            return functools.partial(
-                fix_s3_host, default_endpoint_url=None)
 
         # By default, try to use virtual style with path fallback.
         return fix_s3_host
@@ -563,6 +567,15 @@ class BaseClient(object):
 
     def _make_api_call(self, operation_name, api_params):
         operation_model = self._service_model.operation_model(operation_name)
+        service_name = self._service_model.service_name
+        history_recorder.record('API_CALL', {
+            'service': service_name,
+            'operation': operation_name,
+            'params': api_params,
+        })
+        if operation_model.deprecated:
+            logger.debug('Warning: %s.%s() is deprecated',
+                         service_name, operation_name)
         request_context = {
             'client_region': self.meta.region_name,
             'client_config': self.meta.config,
@@ -602,6 +615,16 @@ class BaseClient(object):
 
     def _convert_to_request_dict(self, api_params, operation_model,
                                  context=None):
+        api_params = self._emit_api_params(
+            api_params, operation_model, context)
+        request_dict = self._serializer.serialize_to_request(
+            api_params, operation_model)
+        prepare_request_dict(request_dict, endpoint_url=self._endpoint.host,
+                             user_agent=self._client_config.user_agent,
+                             context=context)
+        return request_dict
+
+    def _emit_api_params(self, api_params, operation_model, context):
         # Given the API params provided by the user and the operation_model
         # we can serialize the request to a request_dict.
         operation_name = operation_model.name
@@ -623,13 +646,7 @@ class BaseClient(object):
                 endpoint_prefix=self._service_model.endpoint_prefix,
                 operation_name=operation_name),
             params=api_params, model=operation_model, context=context)
-
-        request_dict = self._serializer.serialize_to_request(
-            api_params, operation_model)
-        prepare_request_dict(request_dict, endpoint_url=self._endpoint.host,
-                             user_agent=self._client_config.user_agent,
-                             context=context)
-        return request_dict
+        return api_params
 
     def get_paginator(self, operation_name):
         """Create a paginator for an operation.

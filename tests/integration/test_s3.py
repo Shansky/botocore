@@ -582,7 +582,7 @@ class TestS3PresignUsStandard(BaseS3PresignTest):
             'get_object', Params={'Bucket': self.bucket_name, 'Key': self.key})
         self.assertTrue(
             presigned_url.startswith(
-                'https://s3.amazonaws.com/%s/%s' % (
+                'https://%s.s3.amazonaws.com/%s' % (
                     self.bucket_name, self.key)),
             "Host was suppose to be the us-east-1 endpoint, instead "
             "got: %s" % presigned_url)
@@ -647,7 +647,7 @@ class TestS3PresignUsStandard(BaseS3PresignTest):
         # Make sure the correct endpoint is being used
         self.assertTrue(
             post_args['url'].startswith(
-                'https://s3.amazonaws.com/%s' % self.bucket_name),
+                'https://%s.s3.amazonaws.com/' % self.bucket_name),
             "Host was suppose to use us-east-1 endpoint, instead "
             "got: %s" % post_args['url'])
 
@@ -679,7 +679,14 @@ class TestS3PresignNonUsStandard(BaseS3PresignTest):
         self.assertEqual(requests.get(presigned_url).content, b'foo')
 
     def test_presign_sigv4(self):
+        # For a newly created bucket, you can't use virtualhosted
+        # addressing and 's3v4' due to the backwards compat behavior
+        # using '.s3.amazonaws.com' for anything in the AWS partition.
+        # Instead you either have to use the older 's3' signature version
+        # of you have to use path style addressing.  The latter is being
+        # done here.
         self.client_config.signature_version = 's3v4'
+        self.client_config.s3 = {'addressing_style': 'path'}
         self.client = self.session.create_client(
             's3', config=self.client_config)
         presigned_url = self.client.generate_presigned_url(
@@ -687,7 +694,7 @@ class TestS3PresignNonUsStandard(BaseS3PresignTest):
 
         self.assertTrue(
             presigned_url.startswith(
-                'https://s3-us-west-2.amazonaws.com/%s/%s' % (
+                'https://s3.us-west-2.amazonaws.com/%s/%s' % (
                     self.bucket_name, self.key)),
             "Host was suppose to be the us-west-2 endpoint, instead "
             "got: %s" % presigned_url)
@@ -748,7 +755,7 @@ class TestS3PresignNonUsStandard(BaseS3PresignTest):
         # Make sure the correct endpoint is being used
         self.assertTrue(
             post_args['url'].startswith(
-                'https://s3-us-west-2.amazonaws.com/%s' % self.bucket_name),
+                'https://%s.s3.amazonaws.com/' % self.bucket_name),
             "Host was suppose to use DNS style, instead "
             "got: %s" % post_args['url'])
 
@@ -896,6 +903,31 @@ class TestS3SigV4Client(BaseS3ClientTest):
             Bucket=self.bucket_name, Key='foo.txt',
             Body=b'foobar', Metadata={'foo': '  multi    spaces  '})
         self.assert_status_code(response, 200)
+
+    def test_bad_request_on_invalid_credentials(self):
+        # A previous bug would cause this to hang.  We want
+        # to verify we get the 400 response.
+        # In order to test we need a key that actually
+        # exists so we use the properly configured self.client.
+        self.client.put_object(Bucket=self.bucket_name,
+                               Key='foo.txt',
+                               Body=b'asdfasdf')
+        # Now we create a client with a bad session token
+        # which should give us a 400 response.
+        creds = self.session.get_credentials()
+        client = self.session.create_client(
+            's3', self.region,
+            config=Config(signature_version='s3v4'),
+            aws_access_key_id=creds.access_key,
+            aws_secret_access_key=creds.secret_key,
+            aws_session_token='bad-token-causes-400',
+        )
+        with self.assertRaises(ClientError) as e:
+            client.head_object(
+                Bucket=self.bucket_name,
+                Key='foo.txt',
+            )
+        self.assertEqual(e.exception.response['Error']['Code'], '400')
 
 
 class TestSSEKeyParamValidation(BaseS3ClientTest):

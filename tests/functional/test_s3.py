@@ -15,7 +15,9 @@ from nose.tools import assert_equal
 
 import botocore.session
 from botocore.config import Config
-from botocore.exceptions import ParamValidationError
+from botocore.compat import urlsplit
+from botocore.exceptions import ParamValidationError, ClientError
+from botocore import UNSIGNED
 
 
 class TestS3BucketValidation(unittest.TestCase):
@@ -222,7 +224,10 @@ class TestRegionRedirect(BaseS3OperationTest):
     def setUp(self):
         super(TestRegionRedirect, self).setUp()
         self.client = self.session.create_client(
-            's3', 'us-west-2', config=Config(signature_version='s3v4'))
+            's3', 'us-west-2', config=Config(
+                signature_version='s3v4',
+                s3={'addressing_style': 'path'},
+            ))
 
         self.redirect_response = mock.Mock()
         self.redirect_response.headers = {
@@ -241,6 +246,23 @@ class TestRegionRedirect(BaseS3OperationTest):
             b'    <Endpoint>foo.s3.eu-central-1.amazonaws.com</Endpoint>'
             b'</Error>')
 
+        self.bad_signing_region_response = mock.Mock()
+        self.bad_signing_region_response.headers = {
+            'x-amz-bucket-region': 'eu-central-1'
+        }
+        self.bad_signing_region_response.status_code = 400
+        self.bad_signing_region_response.content = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<Error>'
+            b'  <Code>AuthorizationHeaderMalformed</Code>'
+            b'  <Message>the region us-west-2 is wrong; '
+            b'expecting eu-central-1</Message>'
+            b'  <Region>eu-central-1</Region>'
+            b'  <RequestId>BD9AA1730D454E39</RequestId>'
+            b'  <HostId></HostId>'
+            b'</Error>'
+        )
+
         self.success_response = mock.Mock()
         self.success_response.headers = {}
         self.success_response.status_code = 200
@@ -255,6 +277,16 @@ class TestRegionRedirect(BaseS3OperationTest):
             b'    <IsTruncated>false</IsTruncated>'
             b'</ListBucketResult>')
 
+    def create_response(self, content=b'',
+                        status_code=200, headers=None):
+        response = mock.Mock()
+        if headers is None:
+            headers = {}
+        response.headers = headers
+        response.content = content
+        response.status_code = status_code
+        return response
+
     def test_region_redirect(self):
         self.http_session_send_mock.side_effect = [
             self.redirect_response, self.success_response]
@@ -263,7 +295,7 @@ class TestRegionRedirect(BaseS3OperationTest):
         self.assertEqual(self.http_session_send_mock.call_count, 2)
 
         calls = [c[0][0] for c in self.http_session_send_mock.call_args_list]
-        initial_url = ('https://s3-us-west-2.amazonaws.com/foo'
+        initial_url = ('https://s3.us-west-2.amazonaws.com/foo'
                        '?encoding-type=url')
         self.assertEqual(calls[0].url, initial_url)
 
@@ -285,7 +317,7 @@ class TestRegionRedirect(BaseS3OperationTest):
 
         self.assertEqual(self.http_session_send_mock.call_count, 3)
         calls = [c[0][0] for c in self.http_session_send_mock.call_args_list]
-        initial_url = ('https://s3-us-west-2.amazonaws.com/foo'
+        initial_url = ('https://s3.us-west-2.amazonaws.com/foo'
                        '?encoding-type=url')
         self.assertEqual(calls[0].url, initial_url)
 
@@ -293,6 +325,89 @@ class TestRegionRedirect(BaseS3OperationTest):
                      '?encoding-type=url')
         self.assertEqual(calls[1].url, fixed_url)
         self.assertEqual(calls[2].url, fixed_url)
+
+    def test_resign_request_with_region_when_needed(self):
+        self.http_session_send_mock.side_effect = [
+            self.bad_signing_region_response, self.success_response,
+        ]
+
+        # Create a client with no explicit configuration so we can
+        # verify the default behavior.
+        client = self.session.create_client(
+            's3', 'us-west-2')
+        first_response = client.list_objects(Bucket='foo')
+        self.assertEqual(
+            first_response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+        self.assertEqual(self.http_session_send_mock.call_count, 2)
+        calls = [c[0][0] for c in self.http_session_send_mock.call_args_list]
+        initial_url = ('https://foo.s3.us-west-2.amazonaws.com/'
+                       '?encoding-type=url')
+        self.assertEqual(calls[0].url, initial_url)
+
+        fixed_url = ('https://foo.s3.eu-central-1.amazonaws.com/'
+                     '?encoding-type=url')
+        self.assertEqual(calls[1].url, fixed_url)
+
+    def test_resign_request_in_us_east_1(self):
+        bad_request_response = self.create_response(status_code=400)
+        bad_head_bucket_response = self.create_response(
+            status_code=400,
+            headers={'x-amz-bucket-region': 'eu-central-1'}
+        )
+        head_bucket_response = self.create_response(
+            headers={
+                'x-amz-bucket-region': 'eu-central-1'
+            },
+            status_code=200,
+        )
+        request_response = self.create_response(status_code=200)
+        self.http_session_send_mock.side_effect = [
+            bad_request_response,
+            bad_head_bucket_response,
+            head_bucket_response,
+            request_response,
+        ]
+
+        # Verify that the default behavior in us-east-1 will redirect
+        client = self.session.create_client('s3', 'us-east-1')
+        response = client.head_object(Bucket='foo', Key='bar')
+        self.assertEqual(response['ResponseMetadata']['HTTPStatusCode'], 200)
+
+        self.assertEqual(self.http_session_send_mock.call_count, 4)
+        calls = [c[0][0] for c in self.http_session_send_mock.call_args_list]
+        initial_url = ('https://foo.s3.amazonaws.com/bar')
+        self.assertEqual(calls[0].url, initial_url)
+
+        fixed_url = ('https://foo.s3.eu-central-1.amazonaws.com/bar')
+        self.assertEqual(calls[-1].url, fixed_url)
+
+    def test_resign_request_in_us_east_1_fails(self):
+        bad_request_response = self.create_response(status_code=400)
+        bad_head_bucket_response = self.create_response(
+            status_code=400,
+            headers={'x-amz-bucket-region': 'eu-central-1'}
+        )
+        head_bucket_response = self.create_response(
+            headers={
+                'x-amz-bucket-region': 'eu-central-1'
+            }
+        )
+        # The final request still fails with a 400.
+        request_response = self.create_response(status_code=400)
+
+        self.http_session_send_mock.side_effect = [
+            bad_request_response,
+            bad_head_bucket_response,
+            head_bucket_response,
+            request_response,
+        ]
+
+        # Verify that the final 400 response is propagated
+        # back to the user.
+        client = self.session.create_client('s3', 'us-east-1')
+        with self.assertRaises(ClientError) as e:
+            client.head_object(Bucket='foo', Key='bar')
 
 
 class TestGeneratePresigned(BaseS3OperationTest):
@@ -350,6 +465,49 @@ class TestGeneratePresigned(BaseS3OperationTest):
         self.assertEqual(
             'https://s3.us-east-2.amazonaws.com/', url)
 
+    def test_presign_url_with_ssec(self):
+        config = Config(signature_version='s3')
+        client = self.session.create_client('s3', 'us-east-1', config=config)
+        url = client.generate_presigned_url(
+            ClientMethod='get_object',
+            Params={
+                'Bucket': 'mybucket',
+                'Key': 'mykey',
+                'SSECustomerKey': 'a' * 32,
+                'SSECustomerAlgorithm': 'AES256'
+            }
+        )
+        # The md5 of the sse-c key will be injected when parameters are
+        # built so it should show up in the presigned url as well.
+        self.assertIn(
+            'x-amz-server-side-encryption-customer-key-md5=', url
+        )
+
+    def test_presign_s3_accelerate(self):
+        config = Config(signature_version=botocore.UNSIGNED,
+                        s3={'use_accelerate_endpoint': True})
+        client = self.session.create_client('s3', 'us-east-1', config=config)
+        url = client.generate_presigned_url(
+            ClientMethod='get_object',
+            Params={'Bucket': 'mybucket', 'Key': 'mykey'}
+        )
+        # The url should be the accelerate endpoint
+        self.assertEqual(
+            'https://mybucket.s3-accelerate.amazonaws.com/mykey', url)
+
+    def test_presign_post_s3_accelerate(self):
+        config = Config(signature_version=botocore.UNSIGNED,
+                        s3={'use_accelerate_endpoint': True})
+        client = self.session.create_client('s3', 'us-east-1', config=config)
+        parts = client.generate_presigned_post(
+            Bucket='mybucket', Key='mykey')
+        # The url should be the accelerate endpoint
+        expected = {
+            'fields': {'key': 'mykey'},
+            'url': 'https://mybucket.s3-accelerate.amazonaws.com/'
+        }
+        self.assertEqual(parts, expected)
+
 
 def test_correct_url_used_for_s3():
     # Test that given various sets of config options and bucket names,
@@ -359,39 +517,78 @@ def test_correct_url_used_for_s3():
     # The default behavior for sigv2. DNS compatible buckets
     yield t.case(region='us-west-2', bucket='bucket', key='key',
                  signature_version='s3',
-                 expected_url='https://bucket.s3.amazonaws.com/key')
+                 expected_url='https://bucket.s3.us-west-2.amazonaws.com/key')
     yield t.case(region='us-east-1', bucket='bucket', key='key',
                  signature_version='s3',
                  expected_url='https://bucket.s3.amazonaws.com/key')
     yield t.case(region='us-west-1', bucket='bucket', key='key',
                  signature_version='s3',
-                 expected_url='https://bucket.s3.amazonaws.com/key')
+                 expected_url='https://bucket.s3.us-west-1.amazonaws.com/key')
     yield t.case(region='us-west-1', bucket='bucket', key='key',
                  signature_version='s3', is_secure=False,
-                 expected_url='http://bucket.s3.amazonaws.com/key')
+                 expected_url='http://bucket.s3.us-west-1.amazonaws.com/key')
 
-    # The default behavior for sigv4. DNS compatible buckets still get path
-    # style addresses.
+    # Virtual host addressing is independent of signature version.
     yield t.case(region='us-west-2', bucket='bucket', key='key',
                  signature_version='s3v4',
                  expected_url=(
-                     'https://s3-us-west-2.amazonaws.com/bucket/key'))
+                     'https://bucket.s3.us-west-2.amazonaws.com/key'))
     yield t.case(region='us-east-1', bucket='bucket', key='key',
                  signature_version='s3v4',
-                 expected_url='https://s3.amazonaws.com/bucket/key')
+                 expected_url='https://bucket.s3.amazonaws.com/key')
     yield t.case(region='us-west-1', bucket='bucket', key='key',
                  signature_version='s3v4',
                  expected_url=(
-                     'https://s3-us-west-1.amazonaws.com/bucket/key'))
+                     'https://bucket.s3.us-west-1.amazonaws.com/key'))
     yield t.case(region='us-west-1', bucket='bucket', key='key',
                  signature_version='s3v4', is_secure=False,
                  expected_url=(
-                     'http://s3-us-west-1.amazonaws.com/bucket/key'))
+                     'http://bucket.s3.us-west-1.amazonaws.com/key'))
+
+    # Regions outside of the 'aws' partition.
+    # These should still default to virtual hosted addressing
+    # unless explicitly configured otherwise.
+    yield t.case(region='cn-north-1', bucket='bucket', key='key',
+                 signature_version='s3v4',
+                 expected_url=(
+                     'https://bucket.s3.cn-north-1.amazonaws.com.cn/key'))
+    # This isn't actually supported because cn-north-1 is sigv4 only,
+    # but we'll still double check that our internal logic is correct
+    # when building the expected url.
+    yield t.case(region='cn-north-1', bucket='bucket', key='key',
+                 signature_version='s3',
+                 expected_url=(
+                     'https://bucket.s3.cn-north-1.amazonaws.com.cn/key'))
+    # If the request is unsigned, we should have the default
+    # fix_s3_host behavior which is to use virtual hosting where
+    # possible but fall back to path style when needed.
+    yield t.case(region='cn-north-1', bucket='bucket', key='key',
+                 signature_version=UNSIGNED,
+                 expected_url=(
+                     'https://bucket.s3.cn-north-1.amazonaws.com.cn/key'))
+    yield t.case(region='cn-north-1', bucket='bucket.dot', key='key',
+                 signature_version=UNSIGNED,
+                 expected_url=(
+                     'https://s3.cn-north-1.amazonaws.com.cn/bucket.dot/key'))
+
+    # And of course you can explicitly specify which style to use.
+    virtual_hosting = {'addressing_style': 'virtual'}
+    yield t.case(region='cn-north-1', bucket='bucket', key='key',
+                 signature_version=UNSIGNED,
+                 s3_config=virtual_hosting,
+                 expected_url=(
+                     'https://bucket.s3.cn-north-1.amazonaws.com.cn/key'))
+    path_style = {'addressing_style': 'path'}
+    yield t.case(region='cn-north-1', bucket='bucket', key='key',
+                 signature_version=UNSIGNED,
+                 s3_config=path_style,
+                 expected_url=(
+                     'https://s3.cn-north-1.amazonaws.com.cn/bucket/key'))
 
     # If you don't have a DNS compatible bucket, we use path style.
     yield t.case(
         region='us-west-2', bucket='bucket.dot', key='key',
-        expected_url='https://s3-us-west-2.amazonaws.com/bucket.dot/key')
+        expected_url='https://s3.us-west-2.amazonaws.com/bucket.dot/key')
     yield t.case(
         region='us-east-1', bucket='bucket.dot', key='key',
         expected_url='https://s3.amazonaws.com/bucket.dot/key')
@@ -421,7 +618,7 @@ def test_correct_url_used_for_s3():
     yield t.case(
         region='us-west-2', bucket='bucket', key='key',
         s3_config=virtual_hosting,
-        expected_url='https://bucket.s3-us-west-2.amazonaws.com/key')
+        expected_url='https://bucket.s3.us-west-2.amazonaws.com/key')
     yield t.case(
         region='eu-central-1', bucket='bucket', key='key',
         s3_config=virtual_hosting,
@@ -436,17 +633,16 @@ def test_correct_url_used_for_s3():
     yield t.case(
         region='us-gov-west-1', bucket='bucket', key='key',
         s3_config=virtual_hosting,
-        expected_url='https://bucket.s3-us-gov-west-1.amazonaws.com/key')
+        expected_url='https://bucket.s3.us-gov-west-1.amazonaws.com/key')
 
-    # Test restricted regions not do virtual host by default
     yield t.case(
         region='us-gov-west-1', bucket='bucket', key='key',
         signature_version='s3',
-        expected_url='https://s3-us-gov-west-1.amazonaws.com/bucket/key')
+        expected_url='https://bucket.s3.us-gov-west-1.amazonaws.com/key')
     yield t.case(
         region='fips-us-gov-west-1', bucket='bucket', key='key',
         signature_version='s3',
-        expected_url='https://s3-fips-us-gov-west-1.amazonaws.com/bucket/key')
+        expected_url='https://bucket.s3-fips-us-gov-west-1.amazonaws.com/key')
 
 
     # Test path style addressing.
@@ -524,11 +720,11 @@ def test_correct_url_used_for_s3():
     yield t.case(
         region='us-east-1', bucket='bucket', key='key',
         s3_config=use_dualstack, signature_version='s3v4',
-        expected_url='https://s3.dualstack.us-east-1.amazonaws.com/bucket/key')
+        expected_url='https://bucket.s3.dualstack.us-east-1.amazonaws.com/key')
     yield t.case(
         region='us-west-2', bucket='bucket', key='key',
         s3_config=use_dualstack, signature_version='s3v4',
-        expected_url='https://s3.dualstack.us-west-2.amazonaws.com/bucket/key')
+        expected_url='https://bucket.s3.dualstack.us-west-2.amazonaws.com/key')
     # Non DNS compatible buckets use path style for dual stack.
     yield t.case(
         region='us-west-2', bucket='bucket.dot', key='key',
@@ -650,6 +846,7 @@ def _verify_expected_endpoint_url(region, bucket, key, s3_config,
         environ['AWS_ACCESS_KEY_ID'] = 'access_key'
         environ['AWS_SECRET_ACCESS_KEY'] = 'secret_key'
         environ['AWS_CONFIG_FILE'] = 'no-exist-foo'
+        environ['AWS_SHARED_CREDENTIALS_FILE'] = 'no-exist-foo'
         session = create_session()
         session.config_filename = 'no-exist-foo'
         config = Config(
@@ -665,3 +862,130 @@ def _verify_expected_endpoint_url(region, bucket, key, s3_config,
                           Key=key, Body=b'bar')
             request_sent = mock_send.call_args[0][0]
             assert_equal(request_sent.url, expected_url)
+
+
+def _create_s3_client(region, is_secure, endpoint_url, s3_config,
+                      signature_version):
+    environ = {}
+    with mock.patch('os.environ', environ):
+        environ['AWS_ACCESS_KEY_ID'] = 'access_key'
+        environ['AWS_SECRET_ACCESS_KEY'] = 'secret_key'
+        environ['AWS_CONFIG_FILE'] = 'no-exist-foo'
+        environ['AWS_SHARED_CREDENTIALS_FILE'] = 'no-exist-foo'
+        session = create_session()
+        session.config_filename = 'no-exist-foo'
+        config = Config(
+            signature_version=signature_version,
+            s3=s3_config
+        )
+        s3 = session.create_client('s3', region_name=region, use_ssl=is_secure,
+                                   config=config,
+                                   endpoint_url=endpoint_url)
+        return s3
+
+
+def test_addressing_for_presigned_urls():
+    # See TestGeneratePresigned for more detailed test cases
+    # on presigned URLs.  Here's we're just focusing on the
+    # adddressing mode used for presigned URLs.
+    # We special case presigned URLs due to backwards
+    # compatibility.
+    t = S3AddressingCases(_verify_presigned_url_addressing)
+
+    # us-east-1, or the "global" endpoint. A signature version of
+    # None means the user doesn't have signature version configured.
+    yield t.case(region='us-east-1', bucket='bucket', key='key',
+                 signature_version=None,
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-east-1', bucket='bucket', key='key',
+                 signature_version='s3',
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-east-1', bucket='bucket', key='key',
+                 signature_version='s3v4',
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-east-1', bucket='bucket', key='key',
+                 signature_version='s3v4',
+                 s3_config={'addressing_style': 'path'},
+                 expected_url='https://s3.amazonaws.com/bucket/key')
+
+    # A region that supports both 's3' and 's3v4'.
+    yield t.case(region='us-west-2', bucket='bucket', key='key',
+                 signature_version=None,
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-west-2', bucket='bucket', key='key',
+                 signature_version='s3',
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-west-2', bucket='bucket', key='key',
+                 signature_version='s3v4',
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-west-2', bucket='bucket', key='key',
+                 signature_version='s3v4',
+                 s3_config={'addressing_style': 'path'},
+                 expected_url='https://s3.us-west-2.amazonaws.com/bucket/key')
+
+    # An 's3v4' only region.
+    yield t.case(region='us-east-2', bucket='bucket', key='key',
+                 signature_version=None,
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-east-2', bucket='bucket', key='key',
+                 signature_version='s3',
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-east-2', bucket='bucket', key='key',
+                 signature_version='s3v4',
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+    yield t.case(region='us-east-2', bucket='bucket', key='key',
+                 signature_version='s3v4',
+                 s3_config={'addressing_style': 'path'},
+                 expected_url='https://s3.us-east-2.amazonaws.com/bucket/key')
+
+    # Dualstack endpoints
+    yield t.case(
+        region='us-west-2', bucket='bucket', key='key',
+        signature_version=None,
+        s3_config={'use_dualstack_endpoint': True},
+        expected_url='https://bucket.s3.dualstack.us-west-2.amazonaws.com/key')
+    yield t.case(
+        region='us-west-2', bucket='bucket', key='key',
+        signature_version='s3',
+        s3_config={'use_dualstack_endpoint': True},
+        expected_url='https://bucket.s3.dualstack.us-west-2.amazonaws.com/key')
+    yield t.case(
+        region='us-west-2', bucket='bucket', key='key',
+        signature_version='s3v4',
+        s3_config={'use_dualstack_endpoint': True},
+        expected_url='https://bucket.s3.dualstack.us-west-2.amazonaws.com/key')
+
+    # Accelerate
+    yield t.case(region='us-west-2', bucket='bucket', key='key',
+                 signature_version=None,
+                 s3_config={'use_accelerate_endpoint': True},
+                 expected_url='https://bucket.s3-accelerate.amazonaws.com/key')
+
+    # A region that we don't know about.
+    yield t.case(region='us-west-50', bucket='bucket', key='key',
+                 signature_version=None,
+                 expected_url='https://bucket.s3.amazonaws.com/key')
+
+    # Customer provided URL results in us leaving the host untouched.
+    yield t.case(region='us-west-2', bucket='bucket', key='key',
+                 signature_version=None,
+                 customer_provided_endpoint='https://foo.com/',
+                 expected_url='https://foo.com/bucket/key')
+
+
+def _verify_presigned_url_addressing(region, bucket, key, s3_config,
+                                     is_secure=True,
+                                     customer_provided_endpoint=None,
+                                     expected_url=None,
+                                     signature_version=None):
+    s3 = _create_s3_client(region=region, is_secure=is_secure,
+                           endpoint_url=customer_provided_endpoint,
+                           s3_config=s3_config,
+                           signature_version=signature_version)
+    url = s3.generate_presigned_url(
+        'get_object', {'Bucket': bucket, 'Key': key})
+    # We're not trying to verify the params for URL presigning,
+    # those are tested elsewhere.  We just care about the hostname/path.
+    parts = urlsplit(url)
+    actual = '%s://%s%s' % parts[:3]
+    assert_equal(actual, expected_url)

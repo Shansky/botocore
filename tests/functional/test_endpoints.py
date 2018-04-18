@@ -20,6 +20,7 @@ from botocore.session import get_session
 SERVICE_RENAMES = {
     'application-autoscaling': 'autoscaling',
     'appstream': 'appstream2',
+    'autoscaling-plans': 'autoscaling',
     'dynamodbstreams': 'streams.dynamodb',
     'cloudwatch': 'monitoring',
     'efs': 'elasticfilesystem',
@@ -34,8 +35,15 @@ SERVICE_RENAMES = {
     'lex-runtime': 'runtime.lex',
     'mturk': 'mturk-requester',
     'resourcegroupstaggingapi': 'tagging',
+    'sagemaker-runtime': 'runtime.sagemaker',
     'lex-models': 'models.lex',
     'marketplace-entitlement': 'entitlement.marketplace',
+    'pricing': 'api.pricing',
+    'mediastore-data': 'data.mediastore',
+    'iot-jobs-data': 'data.jobs.iot',
+    'kinesis-video-media': 'kinesisvideo',
+    'kinesis-video-archived-media': 'kinesisvideo',
+    'alexaforbusiness': 'a4b',
 }
 
 BLACKLIST = [

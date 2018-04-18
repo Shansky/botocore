@@ -1,12 +1,29 @@
 #!/usr/bin/env python
-import botocore
+import codecs
+import os.path
+import re
 import sys
 
 from setuptools import setup, find_packages
 
 
+here = os.path.abspath(os.path.dirname(__file__))
+
+
+def read(*parts):
+    return codecs.open(os.path.join(here, *parts), 'r').read()
+
+
+def find_version(*file_paths):
+    version_file = read(*file_paths)
+    version_match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]",
+                              version_file, re.M)
+    if version_match:
+        return version_match.group(1)
+    raise RuntimeError("Unable to find version string.")
+
+
 requires = ['jmespath>=0.7.1,<1.0.0',
-            'python-dateutil>=2.1,<3.0.0',
             'docutils>=0.10']
 
 
@@ -21,11 +38,14 @@ if sys.version_info[:2] == (2, 6):
     # JSON objects.  The 2.7 json module has this.  For 2.6
     # we need simplejson.
     requires.append('simplejson==3.3.0')
+    requires.append('python-dateutil>=2.1,<2.7.0')
+else:
+    requires.append('python-dateutil>=2.1,<3.0.0')
 
 
 setup(
     name='botocore',
-    version=botocore.__version__,
+    version=find_version("botocore", "__init__.py"),
     description='Low-level, data-driven core of boto 3.',
     long_description=open('README.rst').read(),
     author='Amazon Web Services',

@@ -321,6 +321,50 @@ class TestDocumentModelDrivenMethod(BaseDocsTest):
         )
         self.assert_contains_line('**Body** (:class:`.StreamingBody`)')
 
+    def test_event_stream_body_in_output(self):
+        self.add_shape_to_params('Payload', 'EventStream')
+        self.json_model['shapes']['SampleOperationInputOutput']['payload'] = \
+            'Payload'
+        self.json_model['shapes']['EventStream'] = {
+            'type': 'structure',
+            'eventstream': True,
+            'members': {'Event': {'shape': 'Event'}}
+        }
+        self.json_model['shapes']['Event'] = {
+            'type': 'structure',
+            'event': True,
+            'members': {
+                'Fields': {
+                    'shape': 'EventFields',
+                    'eventpayload': True,
+                }
+            }
+        }
+        self.json_model['shapes']['EventFields'] = {
+            'type': 'structure',
+            'members': {
+                'Field': {'shape': 'EventField'}
+            }
+        }
+        self.json_model['shapes']['EventField'] = {'type': 'blob'}
+        document_model_driven_method(
+            self.doc_structure, 'foo', self.operation_model,
+            event_emitter=self.event_emitter,
+            method_description='This describes the foo method.',
+            example_prefix='response = client.foo'
+        )
+        self.assert_contains_lines_in_order([
+            "this operation contains an :class:`.EventStream`",
+            "'Payload': EventStream({",
+            "'Event': {",
+            "'Fields': {",
+            "'Field': b'bytes'",
+            "**Payload** (:class:`.EventStream`)",
+            "**Event** *(dict)",
+            "**Fields** *(dict)",
+            "**Field** *(bytes)",
+        ])
+
     def test_streaming_body_in_input(self):
         del self.json_model['operations']['SampleOperation']['output']
         self.add_shape_to_params('Body', 'Blob')
@@ -338,3 +382,19 @@ class TestDocumentModelDrivenMethod(BaseDocsTest):
         # The line in the parameter description
         self.assert_contains_line(
             ':type Body: bytes or seekable file-like object')
+
+    def test_deprecated(self):
+        self.json_model['operations']['SampleOperation']['deprecated'] = True
+        document_model_driven_method(
+            self.doc_structure, 'foo', self.operation_model,
+            event_emitter=self.event_emitter,
+            method_description='This describes the foo method.',
+            example_prefix='response = client.foo'
+        )
+        # The line in the example
+        self.assert_contains_lines_in_order([
+            '  .. danger::',
+            '        This operation is deprecated and may not function as '
+            'expected. This operation should not be used going forward and is '
+            'only kept for the purpose of backwards compatiblity.'
+        ])

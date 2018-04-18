@@ -47,10 +47,22 @@ class TestStyle(unittest.TestCase):
         style.bold('foobar')
         self.assertEqual(style.doc.getvalue(), six.b('**foobar** '))
 
+    def test_empty_bold(self):
+        style = ReSTStyle(ReSTDocument())
+        style.start_b()
+        style.end_b()
+        self.assertEqual(style.doc.getvalue(), six.b(''))
+
     def test_italics(self):
         style = ReSTStyle(ReSTDocument())
         style.italics('foobar')
         self.assertEqual(style.doc.getvalue(), six.b('*foobar* '))
+
+    def test_empty_italics(self):
+        style = ReSTStyle(ReSTDocument())
+        style.start_i()
+        style.end_i()
+        self.assertEqual(style.doc.getvalue(), six.b(''))
 
     def test_p(self):
         style = ReSTStyle(ReSTDocument())
@@ -63,6 +75,12 @@ class TestStyle(unittest.TestCase):
         style = ReSTStyle(ReSTDocument())
         style.code('foobar')
         self.assertEqual(style.doc.getvalue(), six.b('``foobar`` '))
+
+    def test_empty_code(self):
+        style = ReSTStyle(ReSTDocument())
+        style.start_code()
+        style.end_code()
+        self.assertEqual(style.doc.getvalue(), six.b(''))
 
     def test_h1(self):
         style = ReSTStyle(ReSTDocument())
@@ -104,6 +122,27 @@ class TestStyle(unittest.TestCase):
         style.codeblock('foobar')
         self.assertEqual(style.doc.getvalue(),
                          six.b('::\n\n  foobar\n\n\n'))
+
+    def test_important(self):
+        style = ReSTStyle(ReSTDocument())
+        style.start_important()
+        style.end_important()
+        self.assertEqual(style.doc.getvalue(),
+                         six.b('\n\n.. warning::\n\n  \n\n'))
+
+    def test_note(self):
+        style = ReSTStyle(ReSTDocument())
+        style.start_note()
+        style.end_note()
+        self.assertEqual(style.doc.getvalue(),
+                         six.b('\n\n.. note::\n\n  \n\n'))
+
+    def test_danger(self):
+        style = ReSTStyle(ReSTDocument())
+        style.start_danger()
+        style.end_danger()
+        self.assertEqual(style.doc.getvalue(),
+                         six.b('\n\n.. danger::\n\n  \n\n'))
 
     def test_toctree_html(self):
         style = ReSTStyle(ReSTDocument())
@@ -153,7 +192,7 @@ class TestStyle(unittest.TestCase):
         style.end_a()
         self.assertEqual(
             style.doc.getvalue(),
-            six.b('`example <http://example.org>`_ ')
+            six.b('`example <http://example.org>`__ ')
         )
 
     def test_escape_href_link(self):
@@ -163,14 +202,14 @@ class TestStyle(unittest.TestCase):
         style.end_a()
         self.assertEqual(
             style.doc.getvalue(),
-            six.b('`foo\\: the next bar <http://example.org>`_ '))
+            six.b('`foo\\: the next bar <http://example.org>`__ '))
 
     def test_handle_no_text_hrefs(self):
         style = ReSTStyle(ReSTDocument())
         style.start_a(attrs=[('href', 'http://example.org')])
         style.end_a()
         self.assertEqual(style.doc.getvalue(),
-                         six.b('`<http://example.org>`_ '))
+                         six.b('`<http://example.org>`__ '))
 
     def test_sphinx_reference_label_html(self):
         style = ReSTStyle(ReSTDocument())
@@ -296,9 +335,23 @@ class TestStyle(unittest.TestCase):
         self.assertEqual(style.doc.getvalue(),
                          six.b('`MyLink <http://example.com/foo>`_'))
 
-
     def test_external_link_in_man_page(self):
         style = ReSTStyle(ReSTDocument())
         style.doc.target = 'man'
         style.external_link('MyLink', 'http://example.com/foo')
+        self.assertEqual(style.doc.getvalue(), six.b('MyLink'))
+
+    def test_internal_link(self):
+        style = ReSTStyle(ReSTDocument())
+        style.doc.target = 'html'
+        style.internal_link('MyLink', '/index')
+        self.assertEqual(
+            style.doc.getvalue(),
+            six.b(':doc:`MyLink </index>`')
+        )
+
+    def test_internal_link_in_man_page(self):
+        style = ReSTStyle(ReSTDocument())
+        style.doc.target = 'man'
+        style.internal_link('MyLink', '/index')
         self.assertEqual(style.doc.getvalue(), six.b('MyLink'))
