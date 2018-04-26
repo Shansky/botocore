@@ -160,7 +160,7 @@ class AWSHTTPConnection(HTTPConnection):
             # set, it will trigger this custom behavior.
             logger.debug("Waiting for 100 Continue response.")
             # Wait for 1 second for the server to send a response.
-            read, write, exc = select.select([self.sock], [], [self.sock], 1)
+            read = False
             if read:
                 self._handle_expect_response(message_body)
                 return
